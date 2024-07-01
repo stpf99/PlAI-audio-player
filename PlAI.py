@@ -1,9 +1,10 @@
 import os
 import gi
+import sqlite3
+
 gi.require_version('Gtk', '3.0')
 gi.require_version('Gst', '1.0')
-from gi.repository import Gtk
-import numpy as np
+from gi.repository import Gtk, GLib, Pango
 import gi.repository.Gst as Gst
 
 class AudioPlayer(Gtk.Window):
@@ -12,6 +13,8 @@ class AudioPlayer(Gtk.Window):
         Gtk.Window.__init__(self, title="Audio Player PlAI")
 
         self.playlist = []
+        self.current_sort_column = None
+        self.current_sort_order = Gtk.SortType.ASCENDING
 
         # Main container
         self.main_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
@@ -32,19 +35,18 @@ class AudioPlayer(Gtk.Window):
         self.load_playlist_button.connect("clicked", self.on_load_playlist_clicked)
         self.main_box.pack_start(self.load_playlist_button, False, False, 0)
 
+        # ScrolledWindow for the TreeView
+        self.scrolled_window = Gtk.ScrolledWindow()
+        self.scrolled_window.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
+        self.main_box.pack_start(self.scrolled_window, True, True, 0)
+
         # TreeView and ListStore for playlist
-        self.liststore = Gtk.ListStore(str, float, float, float, float, float, str)
+        self.liststore = Gtk.ListStore(str, str, float, float, float, float, float, str)
         self.treeview = Gtk.TreeView(model=self.liststore)
+        self.scrolled_window.add(self.treeview)
 
         # Initialize columns
         self.setup_columns()
-
-        # Enable sorting
-        for column in self.treeview.get_columns():
-            column.set_sort_indicator(True)
-            column.connect("clicked", self.on_column_clicked)
-
-        self.main_box.pack_start(self.treeview, True, True, 0)
 
         # Button to play selected audio
         self.play_button = Gtk.Button(label="Play")
@@ -66,15 +68,26 @@ class AudioPlayer(Gtk.Window):
         self.player = Gst.ElementFactory.make("playbin", "player")
 
     def setup_columns(self):
-        # Column titles and data types
-        columns = [("File", str), ("Tempo", float), ("Duration", float),
-                   ("Energy", float), ("Zero Crossing Rate", float),
-                   ("Danceability", float), ("Spectral Contrast", str)]
+        # Column titles, data types, and max widths
+        columns = [
+            ("Filename", str, 200),
+            ("Tempo", float, 100),
+            ("Duration", float, 100),
+            ("Energy", float, 100),
+            ("Zero Crossing Rate", float, 150),
+            ("Danceability", float, 100),
+            ("Spectral Contrast", str, 200)
+        ]
 
-        for i, (title, data_type) in enumerate(columns):
+        for i, (title, data_type, max_width) in enumerate(columns):
             renderer = Gtk.CellRendererText()
-            column = Gtk.TreeViewColumn(title, renderer, text=i)
-            column.set_sort_column_id(i)  # Set the column to be sortable
+            renderer.set_property("ellipsize", Pango.EllipsizeMode.END)
+            column = Gtk.TreeViewColumn(title, renderer, text=i+1)  # i+1 because full path is at index 0
+            column.set_sort_column_id(i+1)
+            column.set_resizable(True)
+            column.set_min_width(50)
+            column.set_max_width(max_width)
+            column.connect("clicked", self.on_column_clicked)
             self.treeview.append_column(column)
 
     def on_open_directory_clicked(self, widget):
@@ -106,29 +119,40 @@ class AudioPlayer(Gtk.Window):
             print("Please select both audio directory and database file first.")
             return
 
-        self.playlist = self.read_playlist_from_file(self.database_file)
+        self.create_database()
+        self.load_playlist_to_database()
         self.update_playlist_view()
 
-    def read_playlist_from_file(self, filename):
-        playlist = []
+    def create_database(self):
+        self.conn = sqlite3.connect(':memory:')  # Use in-memory database for speed
+        self.cursor = self.conn.cursor()
+        self.cursor.execute('''CREATE TABLE IF NOT EXISTS playlist
+                            (file TEXT, filename TEXT, tempo REAL, duration REAL, energy REAL,
+                            zero_crossing_rate REAL, danceability REAL, spectral_contrast TEXT)''')
 
-        with open(filename, 'r') as file:
-            lines = file.readlines()
+    def load_playlist_to_database(self):
+        with open(self.database_file, 'r') as file:
+            batch = []
+            for line in file:
+                if line.startswith("File:"):
+                    if batch:
+                        self.insert_entry(batch)
+                        batch = []
+                batch.append(line.strip())
+            if batch:
+                self.insert_entry(batch)
+        
+        self.conn.commit()
 
+    def insert_entry(self, batch):
         entry = {}
-        for line in lines:
-            line = line.strip()
+        for line in batch:
             if line.startswith("File:"):
-                if entry:
-                    playlist.append(entry)
-                entry = {'File': line[6:].strip()}
-                audio_file = os.path.join(self.audio_directory, entry['File'])
-                if os.path.exists(audio_file):
-                    entry['File'] = audio_file  # Replace relative path with absolute path
+                full_path = os.path.join(self.audio_directory, line[6:].strip())
+                entry['File'] = full_path
+                entry['Filename'] = os.path.basename(full_path)
             elif line.startswith("Tempo (Librosa)"):
-                # Extract numeric value from string, handle case with brackets
-                tempo_value = line.split(':')[1].strip().split()[0].lstrip('[').rstrip(']')
-                entry['Tempo'] = float(tempo_value)
+                entry['Tempo'] = float(line.split(':')[1].strip().split()[0].lstrip('[').rstrip(']'))
             elif line.startswith("Duration"):
                 entry['Duration'] = float(line.split(':')[1].strip().split()[0])
             elif line.startswith("Energy"):
@@ -136,49 +160,47 @@ class AudioPlayer(Gtk.Window):
             elif line.startswith("Zero Crossing Rate"):
                 entry['Zero Crossing Rate'] = float(line.split(':')[1].strip())
             elif line.startswith("Danceability"):
-                # Parse danceability values
                 danceability_values = line.split(':')[1].strip().split(',')
                 entry['Danceability'] = float(danceability_values[0].strip(' ()'))
             elif line.startswith("Spectral Contrast"):
-                # Parse list of floats
                 spectral_contrast_values = line.split(':')[1].strip().split(',')
-                entry['Spectral Contrast'] = [float(val.strip(' []')) for val in spectral_contrast_values]
+                entry['Spectral Contrast'] = str([float(val.strip(' []')) for val in spectral_contrast_values])
 
-        if entry:
-            playlist.append(entry)
-
-        return playlist
+        self.cursor.execute('''INSERT INTO playlist VALUES (?, ?, ?, ?, ?, ?, ?, ?)''',
+                            (entry.get('File', ''), entry.get('Filename', ''), entry.get('Tempo', 0.0), 
+                             entry.get('Duration', 0.0), entry.get('Energy', 0.0), 
+                             entry.get('Zero Crossing Rate', 0.0), entry.get('Danceability', 0.0), 
+                             entry.get('Spectral Contrast', '[]')))
 
     def update_playlist_view(self):
         self.liststore.clear()
-        for item in self.playlist:
-            # Calculate average spectral contrast
-            if 'Spectral Contrast' in item:
-                spectral_contrast_avg = np.mean(item['Spectral Contrast'])
-            else:
-                spectral_contrast_avg = 0.0
-
-            self.liststore.append([
-                item.get('File', ''),
-                item.get('Tempo', 0.0),
-                item.get('Duration', 0.0),
-                item.get('Energy', 0.0),
-                item.get('Zero Crossing Rate', 0.0),
-                item.get('Danceability', 0.0),
-                str(spectral_contrast_avg)  # Convert to string for display
-            ])
+        order_by = ""
+        if self.current_sort_column is not None:
+            order_by = f"ORDER BY {self.current_sort_column + 1} {'DESC' if self.current_sort_order == Gtk.SortType.DESCENDING else 'ASC'}"
+        self.cursor.execute(f'''SELECT * FROM playlist {order_by}''')
+        for row in self.cursor.fetchall():
+            self.liststore.append(row)
 
     def on_column_clicked(self, column):
-        # Handle sorting
         sort_column_id = column.get_sort_column_id()
-        self.liststore.set_sort_column_id(sort_column_id, Gtk.SortType.ASCENDING)
+        if self.current_sort_column == sort_column_id:
+            self.current_sort_order = Gtk.SortType.DESCENDING if self.current_sort_order == Gtk.SortType.ASCENDING else Gtk.SortType.ASCENDING
+        else:
+            self.current_sort_column = sort_column_id
+            self.current_sort_order = Gtk.SortType.ASCENDING
+
+        for col in self.treeview.get_columns():
+            col.set_sort_indicator(col == column)
+        column.set_sort_order(self.current_sort_order)
+
+        self.update_playlist_view()
 
     def on_play_clicked(self, widget):
         # Play selected audio file
         selection = self.treeview.get_selection()
         model, treeiter = selection.get_selected()
         if treeiter:
-            filepath = model[treeiter][0]  # Get file path from selected row
+            filepath = model[treeiter][0]  # Get full file path from selected row
             self.player.set_property("uri", "file://" + filepath)
             self.player.set_state(Gst.State.PLAYING)
 
